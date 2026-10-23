@@ -17,18 +17,18 @@ const jetbrainsMono = JetBrains_Mono({
 export const metadata: Metadata = {
   title: 'Territorial.io',
   description:
-    'Authentic full-screen Territorial.io game engine with complete deobfuscation, online multiplayer lobby, 24 maps, bot AI, and AI Gym RL training interface.',
+    'Authentic full-screen Territorial.io game engine with complete deobfuscation, singleplayer bots, multiplayer lobbies, 24 maps, and original game physics.',
   openGraph: {
     title: 'Territorial.io',
     description:
-      'Authentic full-screen Territorial.io game engine with complete deobfuscation, online multiplayer lobby, 24 maps, bot AI, and AI Gym RL training interface.',
+      'Authentic full-screen Territorial.io game engine with complete deobfuscation, singleplayer bots, multiplayer lobbies, 24 maps, and original game physics.',
     type: 'website',
   },
   twitter: {
     card: 'summary_large_image',
     title: 'Territorial.io',
     description:
-      'Authentic full-screen Territorial.io game engine with complete deobfuscation, online multiplayer lobby, 24 maps, bot AI, and AI Gym RL training interface.',
+      'Authentic full-screen Territorial.io game engine with complete deobfuscation, singleplayer bots, multiplayer lobbies, 24 maps, and original game physics.',
   },
 };
 
