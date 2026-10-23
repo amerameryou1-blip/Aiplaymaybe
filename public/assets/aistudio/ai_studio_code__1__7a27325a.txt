@@ -1,0 +1,32 @@
+### TASK: Full In-Place Deobfuscation & AI Training Gym Injection for Territorial.io (`name.html`)
+
+You are working with `name.html`, the complete single-file HTML5 build of Territorial.io (~265KB).
+**CRITICAL RULE:** Do NOT rewrite or simplify the game into a clone, and do NOT delete or truncate the compressed map strings (`aLx`), Base64 PNG sprites (`aHY`), kingdom names (`cd`), or localization strings (`aCw`). Every original map, sprite, UI screen, and bot behavior must remain 100% functional.
+
+Perform the following 5 steps on `name.html` using a Python script (do not try to manually re-type 265KB in chat):
+
+1. **Inline the String Array `var S = [...]`:**
+   - Parse `var S = [...]` at the top of `<script>`.
+   - Replace every `S[<index>]` reference in the code with its actual string literal (e.g., `S[0]` -> `"div"`, `S[4]` -> `"canvas"`, `S[20]` -> `"territorial.io"`). Keep `var S = [...]` intact as a fallback.
+
+2. **Annotate Localization Lookups `L(<index>)`:**
+   - Parse `this.L84 = [...]` inside `function aCw()`.
+   - Wherever `L(<number>...)` appears in code, append an inline comment with the English text, e.g. `L(109 /* "LEADERBOARD" */)`, so every UI element and game message is human-readable.
+
+3. **String-Safe Variable, Singleton, Class, and Method Renaming:**
+   - Use a tokenizer that **skips string literals (`"..."` and `'...'`) and regex literals** so Base64 images and compressed map data (`qV = "..."` in `aLx`) are NEVER corrupted!
+   - Rename the obfuscated global singletons, classes, and core methods using the Deobfuscation Dictionary provided below.
+
+4. **Format / Pretty-Print the JavaScript & Disable Dead Telemetry:**
+   - Format the minified code with proper indentation and line breaks so every function, loop, and `if` statement is on its own line.
+   - In the error handler `function a()` at the top, disable the crash-report WebSocket (`wss://territorial.io/s52/`) so offline training never attempts external network connections.
+
+5. **Inject `window.TerritorialGym` Inside the Closure Before `})();`:**
+   - Expose all internal singletons (`gameConfig`, `playerData`, `pixelGrid`, `botConfig`, `botBrain`, `economy`, `navalSystem`, `mapManager`, `gameLoop`, `actionHandler`, `uiManager`) on `window.TerritorialInternals`.
+   - Expose `window.TerritorialGym` with:
+     - `reset({ mapIndex, mapSeed, playerCount, botDifficulty, gameMode })`: Instantly starts an offline single-player game on any of the 24 maps (0-11 procedural, 10-19 & 22-23 realistic maps) with selectable spawn bypassed (`selectableSpawn = 0`).
+     - `step(numTicks, render)`: Advances the exact offline game tick (`ma()` / `stepSimulationTick()`) `numTicks` times synchronously in a loop (allowing 1,000+ ticks/sec headless training), optionally calling `yw()` (`renderFrame()`) at the end.
+     - `getObservation(playerId)`: Returns structured state for RL training (tick, alive, won, gameOver, territory, totalLand, troops, redInterestCap, interestRate, rank, ongoingAttacks, activeBoats, and full list of bordering neighbors with their troops/territory).
+     - `getActionMask(playerId)`: Returns valid actions (canExpandNeutral, attackableEnemyIds, canLaunchBoat, canCrossMountain).
+     - `act(actionObj, playerId)`: Executes land attack (`hY`), mountain attack (`hU`), boat launch (`hd`), boat intercept (`hg`), or cancel attack (`pU`).
+   - Verify the output file opens cleanly with zero syntax errors and save it as `territorial_deobfuscated_full.html`.

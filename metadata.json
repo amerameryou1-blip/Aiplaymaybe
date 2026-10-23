@@ -1,0 +1,6 @@
+{
+  "name": "Territorial.io",
+  "description": "Authentic full-screen Territorial.io game engine with complete deobfuscation, online multiplayer lobby, 24 maps, bot AI, and AI Gym RL training interface.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

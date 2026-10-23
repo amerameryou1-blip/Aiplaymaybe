@@ -1,0 +1,517 @@
+# Territorial.io Architecture, Gameplay Systems, and Reverse Engineering Specification
+## Operational Modes and Match Environments
+Territorial.io organizes gameplay across several distinct match environments, each defined by specialized win conditions, participant caps, diplomatic constraints, and resource mechanics. For an offline engine reconstruction, these environments must be parameterized to replicate the original rules rather than relying on generic real-time strategy conventions.
+| Game Mode | Entity Capacity | Diplomatic Framework | Full-Send Allowance | Primary Win Condition | Dominant Mechanics |
+|---|---|---|---|---|---|
+| **Battle Royale (Standard FFA)** | Up to 500 Entities | Informal Non-Aggression Pacts | Enabled (0% to 100%) | 100% Map Conquest or Peace Ratification | Free expansion, unconstrained offensive strikes, peace sniping |
+| **Battle Royale (No Full-Send)** | Up to 500 Entities | Informal Non-Aggression Pacts | Disabled (Clamped Slider) | 100% Map Conquest or Peace Ratification | Attrition-based expansion, protected borders, long-term compounding |
+| **1v1 Competitive** | Exactly 2 Entities | Strict Adversarial (No Pacts) | Enabled (0% to 100%) | Elimination or Peace Referendum | Neutral bot micro, spawn equity, rapid cutoff vectors |
+| **Multi-Team Confrontation** | 100 to 500 Entities (2–8 Teams) | Rigid Colored Factions | Enabled (0% to 100%) | Annihilation of All Opposing Factions | Friendly-fire lock, taxed balance donation, coordinated pushes |
+| **Zombie / Infection Mode** | Asymmetric (Humans vs. AI) | Binary: Resistance vs. Horde | Enabled (Full-strength Zombie AI) | Total Eradication of Zombie Faction | Fast zombie tick rates, high-capacity Necromancers, instant land conversion |
+In the standard Free-For-All Battle Royale mode, up to 500 entities spawn simultaneously on the map canvas. Every entity acts as an independent sovereign power. The mode allows full-sending, where a player discharges up to 100% of their balance in a single attack. This mechanic creates a high-stakes dynamic: it can breach fortified defenses or retaliate against invaders, but leaves the attacker with zero balance and defenseless against nearby opportunists.
+The No Full-Send Battle Royale variant applies a mathematical ceiling to the deployment slider, preventing sudden balance dumps. By restricting maximum attack allocations to lower fractions of total reserves, the mode prevents early mutual destruction and rewards careful macro-economic compounding over aggressive gambits.
+The 1v1 Competitive mode is designed for direct head-to-head play on symmetrical maps such as White Arena or standardized continental layouts. The map is populated by two players surrounded by low-aggression neutral bots. Success depends on opening efficiency, path optimization through neutral space, and securing borders before engaging the opponent directly.
+Multi-Team modes divide the player pool into two to eight colored factions. The engine enforces friendly-fire protection across shared borders, preventing members of the same faction from attacking or annexing allied pixels. Teammates can also transfer troops directly using a dedicated donation action subject to an overhead transaction tax. Victory is achieved when all opposing teams are eliminated, and all surviving members of the winning team share the victory.
+Zombie Mode, introduced in version 1.76, provides an asymmetric cooperative experience where human players join the White Resistance to fight the automated Black Zombie Horde. The zombie faction operates with specialized economic rules: zombie territories gain balance at accelerated intervals, expand aggressively, and include high-capacity boss units (Necromancers or Over-Zombies) that automatically distribute surplus balance to frontline troops. When a zombie captures human territory, the pixels immediately convert to the horde, requiring coordinated defense and resource sharing from the human team.
+## Spatial Representation, Map Topology, and Raster Memory Architecture
+Territorial.io represents its game world using a discrete 2D raster grid rather than vector polygons or node graphs. Gameplay state is stored directly in indexed byte buffers that mirror the display canvas, ensuring that territory size, borders, and spatial interactions can be calculated efficiently.
+| Architectural Layer | Memory Representation | Data Structure & Precision | Operational Gameplay Responsibility |
+|---|---|---|---|
+| **Visual Terrain Canvas** | RGBA Pixel Buffer | 32-bit Packed Integer Array (Uint32Array) | Visual rendering of biomes, relief shading, and cosmetics; no impact on traversal |
+| **Playable Land Mask** | Binary Spatial Mask | 8-bit Unsigned Byte Array (Uint8Array) | Identifies traversable land (0xFF), open water (0x00), and impassable barriers (0x7F) |
+| **Ownership Grid** | Indexed Entity Array | 16-bit Unsigned Integer Array (Uint16Array) | Tracks pixel ownership (0 = \text{neutral}, 1 \dots N = \text{Entity ID}) |
+| **Frontier Perimeter Buffer** | Sparse Coordinate Set | Ring-buffer of 32-bit Packed (X, Y) Coordinates | Tracks active borders for expansion propagation, combat lines, and naval launches |
+The engine stores the ownership grid as a flat array of size \text{Width} \times \text{Height}. A pixel coordinate (x, y) maps directly to index i = y \times \text{Width} + x. The land mask uses three primary flags: LAND, WATER, and MOUNTAIN. LAND pixels can be claimed and annexed. WATER pixels cannot be claimed, but serve as navigable space for naval units. MOUNTAIN pixels are impassable terrain obstacles that block normal ground movement, but allow instant mining attacks across shared mountain borders.
+Territory ownership does not require geometric continuity. An entity's domain is tracked as the set of all pixels matching its unique ID, regardless of whether they form a single territory, multiple enclaves, or isolated islands. The engine measures territory size L_p as the total count of owned pixels:
+Adjacency is calculated using orthogonal 4-way von Neumann neighborhoods or complete 8-way Moore neighborhoods on the raster grid. A pixel is considered a border pixel if at least one adjacent pixel has a different ownership ID. An entity's defensive strength is pooled globally across all owned land: an attack on a remote island enclave draws from the same total balance pool as an attack on the mainland. However, the speed of land loss depends on local border shape, since more exposed perimeter pixels allow faster enemy penetration.
+## Macro-Economy: Balance, Interest, and Growth Dynamics
+An entity's economic capacity, offensive power, and defensive resistance are represented by a single unified resource: **Balance** (B_p). Balance updates across three nested time intervals: sub-tick mini-ticks, interest ticks, and income cycles.
+```
+Mini-Ti[span_157](start_span)[span_157](end_span)[span_240](start_span)[span_240](end_span)ck: 0.056s (Conquest frontlines, boat movement, collision checks)
+    └── Tick: 0.560s / 10 Mini-Ticks (Compound interest, soft/hard cap enforcement)
+         └── Cycle: 5.600s / 10 Ticks (Territorial rent disbursement: +1 Balance/Pixel)
+
+```
+The fundamental simulation sub-interval is the mini-tick, which runs at t_{\text{mini}} = 0.056\text{ seconds} (56\text{ ms}). Frontline expansion waves, boat movement vectors, and pixel transfers update on this frequency.
+Compound interest is calculated and applied on the interest tick, which occurs every 10 mini-ticks (t_{\text{tick}} = 0.56\text{ seconds}).
+Territorial income is disbursed on the cycle pulse, which occurs every 10 interest ticks (t_{\text{cycle}} = 5.60\text{ seconds}, or 100 mini-ticks).
+### Nominal Interest Determination
+The base interest rate I_{\text{base}} is determined by two factors: an opening time-decay boost and a scaling bonus based on owned territory. Rates are tracked internally in hundredths of a percent (1\% = 100 integer units, 7\% = 700).
+The Initial Augmentation Factor (I_{\text{init}}) provides a high base growth rate during the early game. It begins at 7.00\% (700) at match start (T [span_318](start_span)[span_318](end_span)= 0) and decays linearly over 1,920 ticks (107.52\text{ seconds}) down to 1.00\% (100):
+Territorial Interest (I_{\text{land}}) rewards players for holding large portions of the map. It is evaluated using a precomputed 512-entry Lookup Table (LUT) initialized via integer square-root progression:
+This table yields 1.00\% (100) at near-zero land control and scales up to 2.60\% (260) at 100% world occupation. The nominal base interest before density penalties is the higher of these two values:
+### Density Limits and Interest Penalties
+Balance accumulation is regulated by two land-density thresholds:
+ * The soft limit (optimal capacity) sits at S_p = 100 \times L_p. Below this threshold, entities receive full interest. When balance exceeds S_p, the HUD balance text turns red to warn the player of diminishing returns.
+ * The hard limit (maximum capacity) sits at H_p = 150 \times L_p. Balance cannot exceed this ceiling under any circumstances.
+When balance is between S_p and H_p, the effective interest rate decays linearly toward zero:
+Every 0.56\text{ seconds}, balance increases based on this effective interest rate:
+Every 10 ticks (5.60\text{ seconds}), the entity also receives fixed territorial income of +1\text{ balance} per owned pixel, clamped to the hard cap:
+If an entity loses land to an enemy attack, its soft and hard caps decrease immediately. Any balance that exceeds the new hard cap is discarded, preventing players from hoarding excess troops on reduced territory.
+## Territorial Expansion and Frontier Annexation
+At match start, players expand into unclaimed neutral space (0 on the ownership grid) to establish their initial borders. Annexing neutral land requires active border adjacency and balance investment, and incurs an overhead transaction tax.
+```
+Player Action: Select border & set allocation slider (e.g., 20%)
+    ├── Deduct Overhead Tax: ceil(Balance * 12 / 1024) ≈ 1.171875%
+    ├── Deploy Troops: Transfer allocated units to active expansion pool
+    └── Mini-Tick Expansion: Advance frontier pixels at tier-based propagation speeds
+
+```
+Launching an expansion or land attack incurs an immediate overhead transaction tax:
+The total troops withdrawn from the entity's balance pool equals:
+If an entity attempts to send 100% of its reserves, the engine automatically caps deployment at 100\% - \tau_{\text{land}}, ensuring that the tax deduction cannot force an entity's balance below zero during standard dispatches.
+Annexing neutral pixels consumes deployed troops from the active expansion pool. Conquering one neutral pixel requires approximately 1 to 2\text{ troops} under normal conditions. If the deployed force runs out before the selected territory is fully annexed, expansion halts at the current perimeter. Any unspent troops remaining in the expansion pool once forward movement stops are refunded to the entity's main balance.
+Frontline expansion does not occur instantly across the map. Instead, new pixels are claimed in successive geometric waves whose propagation rate depends on the entity's total land area.
+| Expansion Speed Tier | Land Area Threshold (L_p) | Mini-Tick Propagation Rate | Effective Layers Conquered per Second |
+|---|---|---|---|
+| **Tier 1** | 1 \le L_p < 1,000 | 1 layer per 4 mini-ticks | 4.46\text{ layers/s} |
+| **Tier 2** | 1,000 \le L_p < 10,000 | 1 layer per 3 mini-ticks | 5.95\text{ layers/s}  |
+| **Tier 3** | 10,000 \le L_p < 60,000 | 1 layer per 2 mini-ticks | 8.93\text{ layers/s} |
+| **Tier 4** | 60,000 \le L_p < 160,000 | 1 layer per 1 mini-tick | 17.86\text{ layers/s}[span_477](start_span)[span_477](end_span) |
+| **Tier 5** | 160,000 \le L_p < 300,000 | 2 layers per 1 mini-tick | 35.71\text{ layers/[span_478](start_span)[span_478](end_span)s} |
+| **Tier 6** | L_p \ge 300,000 | 3 layers per 1 mini-tick | 53.57\text{ layers/s} |
+---
+## Combat Resolution, Structural Defense, and Attrition Mechanics
+Combat between competing entities resolves through deterministic mathematical attrition along active borders. The system includes a built-in advantage for defenders: defending troops absorb damage twice as efficiently as attacking troops.
+```
+Attacker: Deploys attacking force (A) and pays 1.171875% tax
+    ├── Combat Exchange: Clamped troop attrition ratio (0.6 to 2.0 window)
+    ├── Defender Advantage: Defending units inflict casualties at 2:1 structural efficiency
+    └── Territorial Breaches: Pixels transfer to attacker if defender's balance is depleted
+
+```
+Defending entities enjoy an inherent 2:1 combat multiplier. For an attacking force of size A, the maximum reduction it can inflict on an intact defender's balance B_d is:
+Conversely, the attacking force suffers casualties at double that rate when engaging a fortified enemy position. Because of this 2:1 defender advantage, attacking an opponent of equal size with more than 10% to 20% of one's balance causes heavy troop losses, leaving the attacker vulnerable to counterattacks from other neighbors.
+Combat exchanges do not occur in a single instant; they resolve across successive mini-ticks while the attacking force pushes against the border. For each simulation tick of active combat:
+Here, \mu_{\text{terrain}} represents environmental resistance (such as higher penalties for crossing mountain terrain), while \sigma_{\text{scale}} reflects frontline engagement width.
+The rate of land loss relative to balance depletion depends on border compactness. Compactness measures the ratio of territory area to perimeter length:
+A player holding an elongated, narrow corridor has low border compactness, spreading their defensive strength thin along a wide perimeter and allowing attackers to claim land quickly. Conversely, a player holding a circular, compact territory concentrates their balance, forcing the attacker to spend significantly more troops per annexed pixel.
+If an entity's balance drops to zero, it can still launch an emergency "Zero Attack" or send a "Zero Boat" (60\text{ troops}). Because the entity has no reserves to cover the attack tax and combat penalties, its balance drops into negative numbers. Negative balances halt compound interest generation entirely, leaving the territory defenseless until cyclical income restores the balance above zero.
+## Specialized Maneuvers: Naval Operations and Mountain Incursions
+Water and mountain tiles introduce specialized movement mechanics that allow players to bypass standard land borders.
+```
+Naval Attacks: Coastal launch -> Water traversal (travel time) -> 2:1 Beachhead [span_333](start_span)[span_333](end_span)combat
+    ├── Spawn Tax: ceil(Balance * 32 / 1024) = 3.125%
+    ├── Mid-Ocean Interception: 1:1 mutual depletion between colliding hostile boats
+    └── Course Redirection Tax: ceil(Balance * 8 / 1024) = 0.78125%
+
+Mountain Attacks: Shared mountain border -> Instant bridgehead placement (Zero travel time)
+
+```
+### Naval Invasions
+An entity controlling coastal pixels can launch naval invasions against any reachable shoreline across water.
+ 1. **Launch Protocol:** The player selects a coastal origin, clicks a destination coastline, and presses the boat action button or hotkey B.
+ 2. **Naval Commission Tax:** Spawning a boat incurs a substantial transaction fee:
+   The deployed troop payload A_{\text{boat}} and the tax \tau_{\text{boat}} are deducted immediately from the entity's balance.
+ 3. **Traversal Dynamics:** The boat renders as an autonomous sprite traveling in a straight line across water at a fixed velocity v_{\text{const}}, requiring travel time to reach its destination.
+ 4. **Mid-Ocean Interceptions:** If two hostile boats cross paths, they engage in mid-ocean combat, draining each other's troops in a 1:1 ratio. The smaller vessel is destroyed, and the surviving boat continues toward its destination with its remaining troops.
+ 5. **Redirection Penalty:** Updating a boat's destination mid-transit incurs a redirection tax of \lceil B_p \times \frac{8}{1024} \rceil \approx 0.78125\%.
+ 6. **Coastal Landing:** Upon reaching the destination shore, the boat attempts to establish a beachhead. Landing on hostile territory is subject to the standard 2:1 defender advantage. The boat must capture at least one pixel upon arrival to establish a permanent presence.
+### Mountain Mining Operations
+Introduced in version 1.99.7.6, mountain ranges can be used to launch surprise attacks across geographical barriers.
+ 1. **Requirements:** The attacking entity must control territory touching a mountain barrier that also borders an enemy or neutral territory.
+ 2. **Execution:** Clicking on an opposing mountain border (or using the Spacebar while pointing at an adjacent mountain sector) launches an instant "mine attack".
+ 3. **Instant Resolution:** Unlike naval boats, mountain attacks do not produce travel-time sprites. A new "mine pixel" appears instantly on the target edge of the mountain, establishing an immediate foothold on the other side.
+## Diplomatic Conventions, Team Transfers, and Cooperative Systems
+Territorial.io supports both informal player diplomacy in free-for-all matches and hardcoded cooperative mechanics in team modes.
+In Free-For-All modes, players can propose non-aggression pacts (NAPs) using the emoji menu. Sending a handshake or shield emoji signals an offer of mutual non-aggression. However, NAPs are entirely non-binding: the game engine does not prevent an entity from attacking a pact partner. Breaking a pact carries no automated penalties beyond losing trust and provoking immediate retaliation.
+In Multi-Team and Zombie Resistance modes, players can transfer troops directly to allies to reinforce contested borders or support a team leader. Transfers are initiated by holding Shift and clicking on allied territory, or by using the donation UI. Donations are subject to a transaction fee:
+The donor loses the full amount D, while the recipient receives D - \tau_{\text{team}}, clamped to their hard balance cap (150 \times L_{\text{recipient}}).
+## Simulation Execution Loop and Priority Scheduling
+To resolve simultaneous actions and maintain determinism across different devices, the simulation loop follows a strict update sequence during each frame.
+```
+Frame Start
+  ├── 1. Input Processing: Dequeue client clicks, hotkeys (WASD, Space, B, P), and agent dispatches
+  ├── 2. Mini-Tick Step (0.056s): Move boats, resolve mid-ocean clashes, advance frontline conquest
+  ├── 3. Macro-Tick Step (0.560s): Calculate interest (RULE-001/002), apply soft/hard caps (RULE-003)
+  ├── 4. Cycle Pulse (5.600s): Disburse fixed land income (+1 per pixel) (RULE-[span_108](start_span)[span_108](end_span)004)
+  └── 5. Lifecycle Assessment: Eliminate 0-pixel entities, check 100% conquest or peace vote
+Frame End / Canvas Render
+
+```
+If two entities target the same neutral or hostile pixel during the same simulation tick, the collision is resolved deterministically. The command with the higher priority hash (or lower entity ID in tiebreaks) executes damage calculations first. When opposing expansion waves meet in neutral space, their forces clash in a 1:1 mutual-depletion exchange; the side with surviving troops claims the contested pixel.
+## Player Elimination, Peace Referendums, and Victory Protocols
+An entity is eliminated the instant its owned land area drops to zero (L_p = 0). Upon elimination:
+ * The player's remaining troops, active naval boats, and pending expansion waves are immediately removed from the simulation.
+ * The eliminated player's pixels are transferred to the conquering entity. Pixels do not revert to neutral space.
+A match can conclude in two ways:
+ 1. **Total Conquest:** An entity (or unified team) wins immediately if it eliminates all opponents and captures every valid land pixel on the map.
+ 2. **Peace Referendum:** In long or deadlocked matches, players can end the game through mutual agreement. Any player can call a peace vote by clicking the Peace button or pressing P. If a supermajority of surviving players votes in favor, the referendum passes and the match ends immediately. Final rankings are awarded based on owned land and balance at that exact instant. Players must watch for "peace sniping," where an opportunistic player launches an attack right as a vote passes to claim a higher rank before the game freezes.
+## Autonomous Agent Architecture and Difficulty Heuristics
+Offline reconstruction requires robust computer-controlled bot agents to fill match lobbies and provide meaningful opposition. The original game features distinct bot difficulty levels that follow predictable decision patterns.
+| Bot Tier | Opening Expansion Profile | Target Selection Logic | Attack Size Allocation | Attack Frequency | Full-Send Propensity |
+|---|---|---|---|---|---|
+| **Very Easy** | Slow, irregular expansion into neutral space | Random adjacent neighbor | High (50\% - 100\%) | High frequency (2 - 4\text{ s}) | Constant / Suicidal |
+| **Easy** | Modest expansion; misses optimal timings | Neighbor with highest border contact | Moderate (30\% - 60\%) | Every 3 - 5\text{ s} | High frequency |
+| **Normal** | Methodical perimeter expansion | Weakest neighbor by balance | Standard (15\% - 30\%) | Once per cycle (5.6\text{ s}) | Retaliatory only |
+| **Hard** | Fast, efficient opening expansion | Lowest troop-density neighbor | Controlled (5\% - 15\%) | End-of-cycle pulses | Only on lethal breakthrough |
+| **Very Hard / Impossible** | Highly optimized openings (Telejo/Greenbiscuit) | Overextended, vulnerable flanks | Micro-bursts (2\% - 8\%) | Aligned with income pulses | Never; saves to 100\time[span_595](start_span)[span_595](end_span)s soft cap |
+| **H Bot** | Aggressive, dynamic micro-expansion | Chokepoints and expansion cutoffs | Adaptive algorithmic scaling | High-frequency micro-bursts | Calculates lethal math accurately |
+When a human player disconnects or surrenders during a live match, an automated routine takes over their empire. An underline is added to the player's username to show they have become a bot. Abandoned player bots prioritize attacks against the largest, strongest neighboring player, often launching heavy assaults that weaken both empires and create opportunities for nearby players.
+## Formal Mathematical Rule System
+The following rules codify the game's mechanics into an implementation-ready specification for the offline engine.
+### RULE-001: Linear Opening Interest Boost
+ * **Description:** Provides an initial interest boost that decays linearly over the first 107.52 seconds of play.
+ * **Applicability:** All Game Modes.
+ * **Preconditions:** Match status is ACTIVE; tick counter T < 1920.
+ * **Inputs:** Global tick counter T \in \mathbb{N}_0.
+ * **State Variables Affected:** Entity nominal interest I_{\text{init}}.
+ * **Formula:**
+   
+ * **Order of Operations:** Evaluated at the start of every Interest Tick (0.56\text{ s}) before calculating density penalties.
+ * **Boundary Conditions:** At T=0, I_{\text{init}} = 700 (7.00\%). At T=1920, I_{\text{init}} = 100 (1.00\%). When T \ge 1920, the rule is bypassed.
+ * **Confidence Level:** **VERIFIED**.
+### RULE-002: Territorial Scale Interest Bonus
+ * **Description:** Grants a long-term interest bonus based on the proportion of map land controlled.
+ * **Applicability:** All Game Modes.
+ * **Preconditions:** Match status is ACTIVE.
+ * **Inputs:** Owned land L_p \in \mathbb{N}, Total map land M_{\text{total[span_349](start_span)[span_349](end_span)}} \in \mathbb{N}.
+ * **State Variables Affected:** Entity base interest I[span_350](start_span)[span_350](end_span)_{\text{land}}.
+ * **Formula:**
+   
+ * **Order of Operations:** Evaluated every tick; compared against I_{\text{init}}(T) using \max(I_{\text{init}}, I_{\text{land}}).
+ * Boundary Conditions: Minimum value is 100 (1.00\%); maximum value at 100% map control is 260 (2.60\%).
+ * **Confidence Level:** **VERIFIED**.
+### RULE-003: Density Penalty and Absolute Troop Cap
+ * **Description:** Reduces interest once an empire exceeds its soft balance limit, and enforces a hard troop cap.
+ * **Applicability:** All Game Modes.
+ * **Preconditions:** Entity balance B_p > 100 [span_356](start_span)[span_356](end_span)\times L_p.
+ * **Inputs:** Balance B_p, Land L_p, Nominal Interest [span_357](start_span)[span_357](end_span)I_{\text{base}}.
+ * **State Variables Affected:** Effective interest I_{\text{eff}}, Balance B_p.
+ * **Formula:**
+   
+ * **Order of Operations:** Evaluated after base interest calculation; directly shapes the balance increase for that tick.
+ * **Boundary Conditions:** At B_p = 100 \[span_360](start_span)[span_360](end_span)cdot L_p, penalty is 0. At B_p = 150 \cdot L_p, I_{\text{eff}} = 0. If land is lost and causes B_p > H_p, excess balance is discarded immediately.
+ * **Confidence Level:** **VERIFIED**.
+### RULE-004: Cyclical Territorial Rent (Income)
+ * **Description:** Grants a fixed balance payout based on total land area every 10 ticks.
+ * **Applicability:** All Game Modes.
+ * **Preconditions:** Global tick T \equiv 0 \pmod{10}.
+ * **Inputs:** Balance B_p, Land L_p, Hard cap H_p.
+ * **State Variables Affected:** Balance B_p.
+ * **Formula:**
+   
+ * **Order of Operations:** Applied on the 10th tick after that tick's compound interest is awarded.
+ * **Confidence Level:** **VERIFIED**.
+### RULE-005: Land Action Overhead Tax
+ * **Description:** Deducts a percentage fee from total balance whenever an attack or expansion is launched.
+ * **Applicability:** All Game Modes.
+ * **Preconditions:** Player inputs a valid land-attack or expansion command.
+ * **Inputs:** Balance B_p, Desired allocation percentage \alpha \in (0, 1].
+ * **State Variables Affected:** Balance B_p, Deployed Attack Force A_{\text{pool}}.
+ * **Formula:**
+   
+ * **Boundary Conditions:** If \alpha = 1.0, deployment is capped at A_{\text{net}} = B_p - \tau_{\text{land}}, ensuring balance does not drop below zero during standard dispatches.
+ * **Confidence Level:** **VERIFIED**.
+### RULE-006: Naval Deployment Tax and Transit Mechanics
+ * **Description:** Deducts an operational fee when launching naval invasions and manages boat travel across water.
+ * **Applicability:** Maps containing water bodies.
+ * **Preconditions:** Entity owns coastal pixels; target coordinate is on a reachable coastline.
+ * **Inputs:** Balance B_p, Target Coordinate (x_t, y_t), Allocation \alpha.
+ * **State Variables Affected:** Balance B_p, Active Boat List \mathcal{V}.
+ * **Formula:**
+   
+ * **Boundary Conditions:** Minimum boat payload is 60\text{ troops} ("Zero Boat"). Mid-ocean collisions with enemy vessels drain troops 1:1 until one is destroyed.
+ * **Confidence Level:** **VERIFIED**.
+### RULE-007: Structural Defender Combat Advantage
+ * **Description:** Defending entities absorb damage at twice the efficiency of the attacking force.
+ * **Applicability:** All PvP and PvE border confrontations.
+ * **Preconditions:** Hostile land frontier engagement.
+ * **Inputs:** Deployed attack force A_{\text{active}}, Defending balance B_d.
+ * **State Variables Affected:** A_{\text{active}}, B_d, OwnershipGrid.
+ * **Formula:**
+   
+ * **Order of Operations:** Evaluated iteratively each mini-tick of active combat until A_{\text{active}} \le 0 or B_d \le 0.
+ * **Confidence Level:** **VERIFIED**.
+### RULE-008: Instant Footslogging via Mountain Sectors
+* **Description:** Allows instant attacks across mountain barriers without travel time.
+ * **Applicability:** Maps with mountain obstacles; version 1.99.7.6+.
+ * **Preconditions:** Entity borders a mountain polygon that also touches the target.
+ * **Inputs:** Click coordinates on adjacent mountain border.
+ * **State Variables Affected:** OwnershipGrid, B_p, B_d.
+ * **Resolution:** Spawns an immediate bridgehead pixel on the far side of the mountain without creating a naval-style travel entity.
+ * **Confidence Level:** **VERIFIED**.
+### RULE-009: Team Allocation Protocol and Transfer Fee
+ * **Description:** Allows direct balance transfers to teammates subject to a transaction fee.
+ * **Applicability:** Multi-Team and Zombie Resistance Modes.
+   * **Preconditions:** Target entity is an active teammate.
+ * **Inputs:** Donated amount D \le B_{\text{donor}}.
+ * **State Variables Affected:** B_{\tex[span_191](start_span)[span_191](end_span)[span_274](start_span)[span_274](end_span)t{donor}}, B_{\text{recipient}}.
+ * **Formula:**
+   
+ * **Confidence Level:** **STRONGLY SUPPORTED**.
+### RULE-010: Peace Referendum Protocol
+ * **Description:** Concludes the match via diplomatic consensus.
+ * **Applicability:** Battle Royale and 1v1 Modes.
+ * **Preconditions:** Initiated by active player; no pending veto.
+ * **Inputs:** Boolean vote tallies weighted by participant balance/land.
+ * **State Variables Affected:** Global match state.
+ * **Resolution:** If voting threshold \ge 51\% (or unanimous among remaining human survivors), the match ends immediately; final ranks are determined by land and balance tallies at that exact moment.
+ * **Confidence Level:** **VERIFIED**.
+## Deterministic State Machine Architecture
+The lifecycle of an offline match follows five operational states:
+| Source State | Event Trigger | Guard Conditions | State Transitions and Side Effects | Target State |
+|---|---|---|---|---|
+| LOBBY_CONFIG | INIT_GAME | Valid mode and map parameters selected | Load map image; build binary land mask; seed deterministic PRNG | SPAWN_SELECTION |
+| SPAWN_SELECTION | SELECT_SPAWN | Coordinate (x,y) is on valid LAND pixel; no nearby spawn conflict | Place 12\text{ pixel} starting cluster; set initial balance B_p = 512  | SPAWN_SELECTION |
+| SPAWN_SELECTION | START_COUNTDOWN | Countdown timer reaches 0 or all human entities are ready | Assign remaining bots randomly across valid land; set tick T = 0 | ACTIVE_MATCH |
+| ACTIVE_MATCH | MINI_TICK_PULSE | Elapsed real time \ge t_{\text{mini}} (56\text{ ms}) | Advance boat positions; expand frontline pixels; deduct combat costs | ACTIVE_MATCH |
+| ACTIVE_MATCH | TICK_PULSE | Elapsed real time \ge t_{\text{tick}} (560\text{ ms}) | Calculate interest rates; apply compound balance growth; check caps | ACTIVE_MATCH |
+| ACTIVE_MATCH | CYCLE_PULSE  | T \equiv 0 \pmod{10} (5.60\text{ s}) | Disburse land income (+L_p); purge dead frontline vectors | ACTIVE_MATCH |
+| ACTIVE_MATCH | PLAYER_DEATH | L_p == 0 for any active entity | Flag entity as eliminated; remove all associated boats and units | ACTIVE_MATCH |
+| ACTIVE_MATCH | CONQUEST_WIN | Single surviving entity or unified team controls all valid land | Halt simulation loops; freeze player balances; log match metrics | MATCH_END |
+| ACTIVE_MATCH | PEACE_RATIFIED | Peace vote meets the required consensus threshold | Halt simulation loops; assign ranks based on current land ownership | MATCH_END |
+| MATCH_END | RESET_MATCH | User clicks exit or restart | Clean up memory grids; clear entity buffers; reset stats | LOBBY_CONFIG |
+## Numerical Reference and Implementation Blueprint
+### Engine Constants and Parameters
+| Parameter Constant | Numeric Value | Description |
+|---|---|---|
+| MINI_TICK_DURATION | 0[span_387](start_span)[span_387](end_span).056\tex[span_110](start_span)[span_110](end_span)t{ s} (56\text{ ms}) | Wave expansion propagation and boat movement sub-step interval |
+| TICK_DURATION | 0.560\text{ s} (560\text{[span_41](start_span)[span_41](end_span)[span_54](start_span)[span_54](end_span) ms}) | Compound interest growth calculation interval |
+| CYCLE_TICKS | 10\text{ Ticks} (5.60\text{ s}) | Fixed territorial rent income disbursement interval |
+| INITIAL_BOOST_TICKS | 1920\text{ Ticks} (107.52\text{ s}) | Duration of opening interest decay (7.00\% \to 1.00\%) |
+| INITIAL_BALA[span_389](start_span)[span_389](end_span)NCE_SPAWN | 512\text{ Units} | Starting balance assigned to every spawned entity |
+| INITIAL_SPAWN_PIXELS | 12\text{ Pixels} | Cluster size allocated to an entity on spawn |
+| SOFT_CAP_M[span_193](start_span)[span_193](end_span)[span_276](start_span)[span_276](end_span)ULTIPLIER | 100\tim[span_43](start_span)[span_43](end_span)[span_56](start_span)[span_56](end_span)es \text{ Land Area} | Balance density threshold where interest penalty begins ("red" balance) |
+| H[span_391](start_span)[span_391](end_span)AR[span_482](start_span)[span_482](end_span)D_CAP_MULTIPLIER | 150\times \text{ Land Area}  | Absolute ceiling on troop balance capacity |
+| LAND_ATTACK_TAX | \lceil B \times 12/1024 \rceil \approx 1.171875\% | Overhead deduction on land attacks and neutral expansion |
+| BOAT_SPAWN_TAX | \lceil B \times 32/1024 \rceil = 3.1250[span_113](start_span)[span_113](end_span)00\% | Overhead deduction applied when launching a naval boat |
+| BOAT_REDIRECT_TAX | \lceil B \times 8/1024 \rceil = 0.781250\% | Overhead deduction applied when updating a boat's trajectory |
+| ALLY_TRANSFER_TAX | \lceil D \times 64/1024 \rceil = 6.250000\% | Transaction fee deducted from team balance donations |
+| DEFENDER_MULTIPLIER | 2.00\times \text{ Ad[span_393](start_span)[span_393](end_span)vantage} | Structural combat advantage enjoyed by defending forces |
+### Reference Engine Logic
+The following JavaScript functions provide an exact, reference-level implementation of the reverse-engineered engine calculations for interest, taxation, and macro ticks.
+```javascript
+const TERRITORIAL_LUT = new Uint16Array(512);
+
+function in[span_541](start_span)[span_541](end_span)itTerritorialLUT() {
+    const[span_4](start_span)[span_4](end_span)[span_7](start_span)[span_7](end_span) scaleDenominator = 508;
+    for (let i = 0; i < 512; i++) {
+        const scaledVal = Math.floor((25600 * i) / scaleDenominator);
+        let root = 0;
+        if (scaledVal >= 1) [span_195](start_span)[span_195](end_span)[span_278](start_span)[span_278](end_span){
+            let guess = Math.floor((scaledVal + 1) / 2);
+            for (let iter = 0; iter < 9; iter[span_196](start_span)[span_196](end_span)[span_279](start_span)[span_279](end_span)++) {
+                guess = Math.floor((guess + Math.floor(scaledVal / guess)) / 2);
+            }
+            root = guess;
+        }
+        TERRITORIAL_LUT[i] = 100 + root;
+    }
+}
+
+function calculateEntityInterest(playerLand, totalMapLand, currentBalance, currentTick) {
+    if (playerLand < 1) return 0;
+
+    const lutIndex = Math.min(511, Math.floor((511 * playerLand) / totalMapLand));
+    let nominalInterest = TERRITORIAL_LUT[lutIndex];
+
+    if (currentTi[span_197](start_span)[span_197](end_span)[span_280](start_span)[span_280](end_span)ck < 1920) {
+        const boost = Math.floor((100[span_44](start_span)[span_44](end_span)[span_57](start_span)[span_57](end_span) * (13440 - 6 * currentTick)) / 1920);
+        nominalInterest = Math.[span_45](start_span)[span_45](end_span)[span_58](start_span)[span_58](end_span)max(boost, n[span_198](start_span)[span_198](end_span)[span_281](start_span)[span_281](end_span)ominalInterest);
+    }
+
+    const softLimit = 100 * playerLand;
+    let effectiveInterest = nominalInterest[span_395](start_span)[span_395](end_span);
+
+    if (cur[span_199](start_span)[span_199](end_span)[span_282](start_span)[span_282](end_span)rentBalance > softLimit) {
+        const excess = currentBalance - softLimit;
+        const penalty = Math.floor((2 * nominalInt[span_200](start_span)[span_200](end_span)[span_283](start_span)[span_283](end_span)erest * excess) / softLimit);
+        effectiveInterest = Math.max(0, nominalInterest - penalty);
+    }
+
+    return Math.min(Math.max(effectiveInterest, 0), 700);
+}
+
+function executeMacroTick(players, totalMapLand, currentTick) {
+    const isIncomeCycle = (currentTick % 10 === 0);
+
+    for (let i = 0; i < players.length; i++) {
+        const p = players[i];
+        if (p.isEliminated) continue;
+
+[span_201](start_span)[span_201](end_span)[span_284](start_span)[span_284](end_span)        const rate = calculateEntityInterest(p.land, totalMapLand, p.balance, currentTick);
+        const interestGain = Math.floor((p.balance * rate) / 10000);
+        p.balance += interestGain;
+
+        if (isIncomeCycle) {
+            p.balance += p.land;
+        }
+
+        const hardCap = 150 * p.land;
+        if (p.balance > hardCap) {
+            p.balance = hardCap;
+        }
+    }
+}
+
+```
+## System Compatibility and Classification Matrix
+| Subsystem Component | Empirical Rule Description | Classification | Primary Evidence Source |
+|---|---|---|---|
+| **Tick Cadence** | Main interest tick = 0.56\text{ s}; Sub-tick = 0.056\text{ s}; Cycle = 5.6\text{ s} | **VERIFIED** | Community Wiki & Engine De-obfuscation |
+| **Initial Boost Formula** | Linear decay: (100 \times (13440 - 6T)) / 1920 over 1,920 ticks | **VERIFIED** | De-obfuscated client script |
+| **Territorial LUT** | 512-entry array generated via Babylonian square-root approximation | **VERIFIED** | De-obfuscated client script |
+| **Soft Limit Penalty** | Linear decay above 1[span_569](start_span)[span_569](end_span)[span_573](start_span)[span_573](end_span)00\times land, reaching 0\% at 150\times land | **VERIFIED** | Frontwars analysis & Client source |
+| **Hard Balance Ceiling** | Strict cutoff at 150 \times \text{Land Pixels} | **VERIFIED** | Frontwars analysis & Client source |
+| **Land Income Pulse** | Exactly +1\text{ balance} per pixel every 10\text{ ticks} (5.60\text{ s}) | **VERIFIED** | Community Wiki & Game Mechanics |
+| **Land Attack Tax** | \lceil B \times 12 / 1024 \rceil \approx 1.171875\% per attack | **VERIFIED** | Attacks Reference & Engine Analysis |
+| **Boat Commission Tax** | \lceil B \times 32 / 1024 \rceil = 3.125\% per boat launched | **VERIFIED** | Attacks Reference & Engine Analysis |
+| **Boat Redirection Tax** | \lceil B \times 8 / 1024 \rceil = 0.78125\% per course correction | **STRONGLY SUPPORTED** | Frontwars Mechanics Breakdown |
+| **Defender Advantage** | 2.0\times structural defense advantage in territorial combat | **VERIFIED** | Attacks Wiki & Gameplay Analysis |
+| **Expansion Speeds** | 6 discrete speed tiers based on total land area (1[span_397](start_span)[span_397](end_span)\text{k}, 10\text{k}, 60\text{k}, 160\text{k}, 300\text{k}) | **STRONGLY SUPPORTED** | Conquest Speed Documentation |
+| **Mountain Mining** | Instant bridgehead placement across shared mountain borders (v1.99.7.6+) | **VERIFIED** | Attacks Reference & Changelog 1.99.7.6 |
+| **Alliance Transfer Tax** | \lceil D \times 64 / 1024 \rceil = 6.25\% transaction fee on team donations | **STRONGLY SUPPORTED** | Frontwars Balance Mechanics |
+| **Border Compactness** | Combat loss ratios scale inversely with perimeter-to-area compactness | **HISTORICAL** | Community Combat Analysis (Modified in 2024 updates) |
+## Verification Suite and Test Scenarios
+The following 100 test scenarios provide a comprehensive test suite to validate gameplay correctness across an offline reconstruction of Territorial.io.
+### Initialization and Spawn Dynamics (TS-001 to TS-010)
+| Test ID | Setup State | Test Input / Action | Expected Result | System Validation Criteria |
+| :--- | :--- | :--- | :--- | :--- |
+| **TS-001** | Map initialized; player clicks valid land pixel | Spawn placement input | Entity spawned with exactly 12 contiguous land pixels and 512 balance. | RULE-001, RULE-003 |
+| **TS-002** | Spawn selection active | Click water pixel | Action rejected; no spawn created; state remains unassigned. | Binary Land Mask |
+| **TS-003** | Spawn selection active | Click mountain pixel | Action rejected; impassable terrain cannot be selected for spawning. | Terrain Mask Guard |
+| **TS-004** | Entity 1 spawned at (x_1, y_1) | Entity 2 attempts spawn at (x[span_206](start_span)[span_206](end_span)[span_289](start_span)[span_289](end_span)_1, y_1) | Action rejected; minimum distance threshold enforced between spawns. | Spatial Collision |
+| **TS-005** | 100 bots configured | Match start triggered | Exactly 100 bots placed across valid land pixels with 12 pixels and 512 balance each. | Agent Population |
+| **TS-006** | Custom land mask loaded | Compute total land M_{\text{total}} | Sum of land mask pixels matches expected count; LUT denominator initialized. | RULE-002 Setup |
+| **TS-007** | Team mode configured (4 teams) | Match start triggered | Entities assigned evenly into 4 team color arrays; friendly fire disabled. | Team Array Matrix |
+| **TS-008** | Zombie mode configured | Match start triggered | Human players assigned to White team; zombie agents assigned to Black team. | Zombie Mode Init |
+| **TS-009** | 1v1 mode configured | Match start triggered | Exactly 2 active player entities spawned; remaining land filled with neutral bots. | 1v1 Arena Rules |
+| **TS-010** | Deterministic seed set (0xABCD) | Run spawn routine twice | Identical bot spawn positions generated across both executions. | PRNG Determinism |
+### Balance Economy and Compound Interest (TS-011 to TS-025)
+| Test ID | Setup State | Test Input / Action | Expected Result | System Validation Criteria |
+|---|---|---|---|---|
+| **TS-011** | T = 0, L_p = 12, B_p = 512 | Advance 1 tick (0.56\text{ s}) | Effective interest = 700 (7.00\%); balance becomes \lfloor 512 \times 1.07 \rfloor = 547. | RULE-001 Verified |
+| **TS-012** | T = 960, L_p = 100, B_p = 5,000 | Calculate base interest rate | Boost evaluates to \lfloor 100 \times (13440 - 5760)/1920 \rfloor = 400 (4.0[span_398](start_span)[span_398](end_span)0\%). | RULE-001 Decay |
+| **TS-013** | T = 1920, L_p = 100, B_p = 5,000 | Calculate base interest rate | Boost evaluates to exactly 100 (1.00\%); initial augmentation concludes. | RULE-001 Plateau |
+| **TS-014** | T = 2500, L_p / M_{\text{total}} = 0.50 | Query interest rate | Territorial LUT index = 255; interest rate yields \approx 2.13\%. | RULE-002 Scaling |
+| **TS-015** | T = 2500, L_p = M_{\text{total}} | Query interest rate | Territorial LUT index = 511; interest yields maximum 260 (2.60\%). | RULE-002 Max Cap |
+| **TS-016** | L_p = 1,000, B_p = 100,000 | Advance 1 tick | Balance is at soft limit (100 \times L); full interest awarded without penalty. | RULE-003 Threshold |
+| **TS-017** | L_p = 1,000, B_p = 125,000, I_{\text{base}} = 200 | Calculate effective interest | Penalty = \lfloor 2 \times 200 \times 25000 / 100000 \rfloor = 100; I_{\text{eff}} = 100 (1.00\%). | RULE-003 Penalty |
+| **TS-018** | L_p = 1,000, B_p = 150,000, I_{\text{base}} = 200 | Advance 1 tick | Balance is at hard limit; effective interest = 0\%; balance remains 150,000. | RULE-003 Zero Growth |
+| **TS-019** | L_p = 1,000, B_p = 160,000 | Advance 1 tick | Balance exceeds hard cap; immediately clamped to 150,000. | RULE-003 Hard Clamp |
+| **TS-020** | T = 9, L_p = 500, B_p = 10,000 | Advance 1 tick (to T = 10) | Interest applied first, followed by +500\t[span_401](start_span)[span_401](end_span)ext{ balance} territorial income. | RULE-004 Income |
+| **TS-021** | T = 10, L_p = 1,000, B_p = 149,800 | Advance 1 cycle pulse | +1,000 land income clamped to hard cap: balance reaches exactly 150,000. | RULE-004 Clamp Guard |
+| **TS-022** | B_p = 0, L_p = 500, T = 5 | Advance 1 tick | Zero balance produces zero interest gain (0 \times I_{\text{eff}} = 0). | Zero Balance Math |
+| **TS-023** | B_p = -50, L_p = 500, T = 5 | Advance 1 tick | Negative balance produces zero interest; balance remains -50 until cycle pulse. | Debt Handling |
+| **TS-024** | B_p = -50, L_p = 500, T = 10 | Advance 1 cycle pulse | +500 land income applied to debt: balance recovers to +450. | Debt Recovery |
+| **TS-025** | Entity interest checked at soft limit | Check UI display state | HUD troop balance font color shifts from default to red. | UI Indicator Sync |
+### Territorial Expansion into Unclaimed Space (TS-026 to TS-038)
+| Test ID | Setup State | Test Input / Action | Expected Result | System Validation Criteria |
+|---|---|---|---|---|
+|  | **TS-026** | B_p = 10,000; click adjacent neutral land | Dispatch 10% allocation | Tax deducted: \lceil 10000 \times 12/1024 \rceil = 118; 1,000 troops deployed. |
+| **TS-027** | B_p = 10,000; slider set to 100% | Dispatch full-send expansion | Dispatches 10,000 - 118 = 9,882 troops; balance does not drop below zero. | RULE-005 Full Send |
+| **TS-028** | L_p = 500; active expansion wave | Measure propagation rate | Wave advances at Tier 1 speed: 1 layer per 4 mini-ticks (4.46\text{ layers/s}). | Expansion Tier 1 |
+| **TS-029** | L_p = 5,000; active expansion wave | Measure propagation rate | Wave advances at Tier 2 speed: 1 layer per 3 mini-ticks (5.95\text{ layers/s}). | Expansion Tier 2 |
+| **TS-030** | L_p = 25,000; active expansion wave | Measure propagation rate | Wave advances at Tier 3 speed: 1 layer per 2 mini-ticks (8.93\text{ layers/s}[span_210](start_span)[span_210](end_span)[span_293](start_span)[span_293](end_span)). | Expansion Tier 3 |
+| **TS-031** | L_p = 100,000; active expansion wave | Measure propagation rate | Wave advances at Tier 4 speed: 1 layer per mini-tick (17.86\text{ layers/s}). | Expansion Tier 4 |
+| **TS-032** | L_p = 200,000; active expansion wave | Measure propagation rate | Wave advances at Tier 5 speed: 2 layers per mini-tick (35.71\text{ layers/s}). | Expansion Tier 5 |
+| **TS-033** | L_p = 400,000; active expansion wave | Measure propagation rate | Wave advances at Tier 6 speed: 3 layers per mini-tick (53.57\text[span_484](start_span)[span_484](end_span){ layers/s}). | Expansion Tier 6 |
+| **TS-034** | Dispatched expansion force of 50 troops | Frontline contains 100 neutral pixels | 50 pixels claimed; expansion stops when force depletes. | Force Exhaustion |
+| **TS-035** | Dispatched expansion force of 500 troops | Target patch has 200 neutral pixels | All 200 pixels claimed; remaining ~300 troops returned to balance. | Balance Refund |
+| **TS-036** | Click neutral land not touching border | Dispatch expansion command | Action rejected; expansion requires border adjacency or naval path. | Adjacency Check |
+| **TS-037** | Two entities expand into same neutral pixel | Both waves arrive on same tick | Pixel awarded based on higher priority hash; tiebreak resolved deterministically. | Collision Tiebreak |
+| **TS-038** | Entity expands into narrow 1-pixel gap | Advance wave | Wave successfully navigates and claims 1-pixel gap without clipping. | Geometry Raster |
+### Combat Resolution, Defense, and Attrition (TS-039 to TS-055)
+| Test ID | Setup State | Test Input / Action | Expected Result | System Validation Criteria |
+|---|---|---|---|---|
+| **TS-039** | Attacker B_a = 10,000; Defender B_d = 10,000 | Attacker sends 1,000 troops | Tax of 12 deducted; defender loses at most \approx 500 balance (2:1 advantage). | RULE-007 Multiplier |
+| **TS-040** | Attacker sends 10,000 troops at B_d = 2,000 | Resolve combat | Defender balance drops to zero; attacker breaks border and annexes pixels. | Defensive Breakthrough |
+| **TS-041** | Defender has B_d = 0 | Attacker sends 500 troops | Zero-defense territory yields pixels with minimal attacker casualties. | Defenseless Annexation |
+| **TS-042** | Entity at B_p = 0 triggers attack | Execute "Zero Attack" | Tax and combat penalties applied; attacker balance drops into negative numbers. | Zero Attack Penalty |
+| **TS-043** | Compact territory (Circle) under attack | Attacker sends 2,000 troops | Territory lost is small; high compactness minimizes pixel loss. | Compactness Defense |
+| **TS-044** | Elongated corridor under attack | Attacker sends 2,000 troops | Significant territory lost; low compactness speeds up land loss. | Perimeter Vulnerability |
+| **TS-045** | Two players attack same defender at once | Simultaneous combat ticks | Defender absorbs damage from both sources at 2:1 ratio; total balance drops. | Multi-Front Defense |
+| **TS-046** | Attacker breaks through into enemy land | Advance front line | Conquered pixels change ownership ID immediately on the raster grid. | Ownership Mask Update |
+| **TS-047** | Attacker cuts defender's empire in two | Check defender state | Defender retains control of both disjoint pockets; balance remains unified. | Topological Integrity |
+| **TS-048** | Attacker captures 500 pixels from defender | Check defender caps | Defender hard cap drops by 500 \times 150 = 75,000; excess balance trimmed. | Cap Adjustment |
+| **TS-049** | Attack launched on plains terrain | Resolve tick | Baseline terrain multiplier \mu = 1.0 applied to attrition. | Terrain Plains |
+| **TS-050** | Attack launched across highlands | Resolve tick | Highland attrition multiplier applied; attack progression slows. | Terrain Highlands |
+| **TS-051** | Player attacks teammate in Team Mode | Click friendly territory | Command blocked by game engine; friendly fire disabled. | Team Protection |
+| **TS-052** | Player attacks NAP partner in FFA | Click allied territory | Attack executes normally; NAPs are non-binding in free-for-all. | FFA Diplomacy |
+| **TS-053** | Attacker sent force runs out mid-combat | Resolve final tick | Attack ends; territory remains with defender at reduced balance. | Attack Depletion |
+| **TS-054** | Player targeted while launching attack | Receive incoming damage | Global balance reduced; active attack force continues independently. | Independent Allocation |
+| **TS-055** | Attacker eliminates all enemy pixels | Resolve final pixel | Defender eliminated; remaining attack units return to attacker's balance. | Annihilation Cleanup |
+### Naval Invasions and Mountain Mining (TS-056 to TS-075)
+| Test ID | Setup State | Test Input / Action | Expected Result | System Validation Criteria |
+|---|---|---|---|---|
+| **TS-056** | Entity has coastal access; B_p = 10,000 | Launch boat (10% allocation) | Tax: \lceil 10000 \times 32/1024 \rceil = 313; boat spawns with 1,000 troops. | RULE-006 Boat Tax |
+| **TS-057** | Entity has no coastal pixels | Attempt boat launch | Action rejected; naval operations require coastal border access. | Coastal Check |
+| **TS-058** | Active boat moving across water | Measure travel velocity | Boat travels in a straight line at fixed speed v_{\text{const}} toward target. | Naval Pathing |
+| **TS-059** | Active boat in transit; player redirects path | Input new water target | Redirection tax deducted (\lceil B_p \times 8/1024 \rceil = 0.78125\%); boat trajectory updates. | Course Correction Fee |
+| **TS-060** | Boat (500 troops) meets enemy boat (300) | Mid-ocean collision | 1:1 troop depletion: enemy boat destroyed; friendly boat continues with 200 troops. | Naval Clash Resolution |
+| **TS-061** | Two friendly boats cross paths | Mid-ocean intersection | Boats pass through each other with no interaction or troop loss. | Friendly Naval Pass |
+| **TS-062** | Boat reaches target neutral island | Resolve beachhead landing | Conquers coastal pixels; claims foothold; unspent troops form base balance. | Amphibious Landing |
+| **TS-063** | Boat (1,000 troops) lands on enemy coast | Resolve hostile landing | Defender's 2:1 advantage applies at landing site; beachhead established if successful. | Coastal Defense Bonus |
+| **TS-064** | Boat with 60 troops sent at B_p = 0 | Launch "Zero Boat" | Boat spawns with 60 troops; entity balance drops into negative numbers. | Zero Boat Rule |
+| **TS-065** | Boat target land captured before arrival | Boat lands on allied pixel | Force absorbed harmlessly into friendly territory balance. | Friendly Absorption |
+| **TS-066** | Boat target land captured by third party | Boat reaches destination | Engages new occupant in combat using standard landing mechanics. | Target Shift Check |
+| **TS-067** | Island territory with no water exits | Attempt boat launch | Pathfinding finds no valid water path to target; action blocked. | Path Validation |
+| **TS-068** | Entity eliminated while boat in transit | Owner land reaches zero | Orphaned boat despawns immediately from the water mask. | Asset Despawn |
+| **TS-069** | Entity touches mountain next to enemy | Launch mountain mine attack | Instant bridgehead created across mountain; no travel delay. | RULE-008 Mountain Mine |
+| **TS-070** | Entity touches mountain not touching enemy | Attempt mountain mine attack | Action rejected; target must border the mountain polygon. | Mountain Adjacency |
+| **TS-071** | Mine attack launched with 500 troops | Resolve mine impact | 500 troops attack target border; standard defender bonus applies. | Mine Combat Resolution |
+| **TS-072** | Mine pixel placed on enemy border | Check territory connectivity | New pixel functions as active border for subsequent land expansion. | Foothold Propagation |
+| **TS-073** | Mountain mine launched at neutral land | Resolve mine impact | Neutral pixel annexed; expansion wave radiates from new mine anchor. | Neutral Mine Claim |
+| **TS-074** | Mine attack attempted on unpassable ridge | Target blocked by obstacle | Action rejected; requires valid destination pixel on opposite slope. | Ridge Barrier Guard |
+| **TS-075** | Successive mine attacks launched | Rapid clicks across mountain | Each mine attack incurs standard land attack tax (1.171875\%). | Mine Taxation Check |
+### Diplomacy, Teams, and Peace Referendums (TS-076 to TS-085)
+| Test ID | Setup State | Test Input / Action | Expected Result | System Validation Criteria |
+|---|---|---|---|---|
+| **TS-076** | Multi-Team mode; B_{\text{donor}} = 10,000 | Donate 1,000 troops to ally | Tax: \lceil 1000 \times 64/1024 \rceil = 63; recipient receives 937 balance. | RULE-009 Transfer Tax |
+| **TS-077** | Recipient balance near hard limit | Ally donates 5,000 balance | Donation capped at recipient's hard limit (150 \times L); excess discarded. | Transfer Hard Cap |
+| **TS-078** | Player attempts donation to enemy | Input donation command | Action blocked; troop transfers restricted to confirmed teammates. | Diplomatic Guard |
+| **TS-079** | FFA match active; 3 players alive | Player 1 presses P (Peace) | Peace referendum initiated; peace banner displays on all active screens. | RULE-010 Call Vote |
+| **TS-080** | Peace vote open; 2 of 3 players vote yes | Vote tallies processed | Supermajority threshold met; match ends in diplomatic peace. | Referendum Ratified |
+| **TS-081** | Peace vote open; player votes no | Single player vetoes vote | Referendum fails; match continues in active play. | Referendum Veto |
+| **TS-082** | Peace vote passes | Review final scoreboard | Players ranked by land area at the exact moment the referendum passed. | Podium Ranking |
+| **TS-083** | Player launches 100% attack as vote passes | Resolve "Peace Snipe" | Attacking player drops below rival's balance; loses first place rank. | Peace Snipe Vulnerability |
+| **TS-084** | Zombie mode: human donates to human | Send 2,000 balance | Donation processed with standard 6.25% fee to reinforce ally. | Zombie Team Synergy |
+| **TS-085** | Zombie boss reaches max balance | Auto-donation routine | Over-Zombie transfers 10%–15% balance to peripheral zombie territories. | Boss Balance Transfer |
+### Bot Decision Logic and Difficulty Scaling (TS-086 to TS-093)
+| Test ID | Setup State | Test Input / Action | Expected Result | System Validation Criteria |
+|---|---|---|---|---|
+| **TS-086** | Very Easy bot initialized | Run decision tick | Bot expands erratically and launches full-send attacks every few seconds. | Very Easy Profile |
+| **TS-087** | Hard bot initialized | Run opening phase | Expands methodically using balanced openings; avoids dropping balance to zero. | Hard Opening Micro |
+| **TS-088** | Hard bot bordered by weak & strong enemies | Target selection routine | Bot targets the weaker neighbor to expand efficiently. | Weak Target Prioritization |
+| **TS-089** | Impossible bot reaches B_p = 100 \times L_p | Balance at soft limit | Bot launches controlled 5\%-10\% attacks to stay near optimal interest. | Interest Optimization |
+| **TS-090** | Bot borders neutral land and enemy | Opening game phase | Bot prioritizes unclaimed neutral land over attacking fortified enemies. | Neutral Land Bias |
+| **TS-091** | Human player leaves live match | Disconnect signal | Entity converted to ghost bot; name underlined; targets largest neighbor. | Abandonment Handling |
+| **TS-092** | Zombie bot borders human player | AI action loop | Zombie attacks aggressively, attempting to infect human territory. | Zombie Aggression Loop |
+| **TS-093** | Bot targeted by naval attack | Inbound boat detected | Bot reserves defensive balance or sends intercepting vessel. | Naval Defense Heuristic |
+### Elimination, End-Game, and Edge Cases (TS-094 to TS-100)
+| Test ID | Setup State | Test Input / Action | Expected Result | System Validation Criteria |
+|---|---|---|---|---|
+| **TS-094** | Entity loses final pixel on raster grid | Territory drops to 0 | Entity marked ELIMINATED; removed from turn loop; UI displays defeat. | Clean Elimination |
+| **TS-095** | Only one active player remains on map | Check match status | Match transitions to MATCH_END; sole survivor declared winner. | Conquest Victory |
+| **TS-096** | Team mode: all rival teams wiped out | Final enemy eliminated | Match ends; surviving team members share victory podium. | Shared Team Victory |
+| **TS-097** | Player adjusts slider with WASD keys | Press hotkey W | Slider adjusts by \times 8/7; capped at 100% maximum. | Hotkey Slider Scaling |
+| **TS-098** | High-load match: 500 entities, 1M pixels | Run 100 simulation ticks | Execution completes with deterministic state consistency; no memory leaks. | Engine Performance |
+| **TS-099** | Window minimized / tab backgrounded | Advance browser clock | Engine catches up deterministically via discrete fixed-step ticks. | Background Step Loop |
+| **TS-100** | Empire controls isolated single-pixel island | Island attacked via boat | Island conquered; total land drops by 1; global balance adjusted accordingly. | Outlier Pixel Conquest |
+## Downstream Coding Agent Implementation Directives
+For an automated coding agent tasked with updating the offline reconstruction codebase, the following procedural directives must be adhered to:
+### Phase 1: Codebase Audit and Mapping
+Before modifying any logic, map each existing offline module against the formal specifications provided in this document:
+ * Inspect how the existing engine tracks map data (whether using 2D arrays, typed byte arrays, or vector shapes) and verify alignment with the raster ownership model.
+ * Review existing growth routines to identify whether the engine uses simplified continuous compounding or linear timers instead of the dual-frequency tick and cycle loop.
+ * Verify whether the existing combat resolver applies symmetric attrition or correctly enforces the 2:1 structural defender bonus.
+### Phase 2: Core Mechanical Refactoring
+Implement verified rules in self-contained, incremental stages:
+ * **Step 1 — Economic Engine:** Replace arbitrary growth routines with calculateEntityInterest() and executeMacroTi[span_105](start_span)[span_105](end_span)ck(). Integrate the 512-entry Lookup Table, initial augmentation decay, soft density penalties, and cyclical land income.
+ * **Step 2 — Transaction Taxation:** Route all land dispatches, naval boat spawns, and team transfers through the explicit transaction tax checks (\tau_{\text{land}} = \lceil B \times 12/1024 \rceil, \tau_{\text{boat}} = \lceil B \times 32/1024 \rceil, \tau_{\text{team}} = \lceil D \times 64/1024 \rceil).
+ * **Step 3 — Combat Resolution:** Refactor frontier skirmishes to enforce the 2:1 defender efficiency advantage, preventing attackers from easily overrunning defended territories.
+ * **Step 4 — Movement Mechanics:** Ensure boat travel uses constant velocities across the water mask, resolves mid-ocean clashes 1:1, and correctly charges the 0.78125\% course redirection fee. Implement instant mountain footslogging for version 1.99.7.6+ parity.
+### Phase 3: Deterministic Simulation Loop
+Decouple visual rendering from the underlying simulation update loop:
+ * The simulation state must update on fixed temporal intervals (56\text{ ms} mini-ticks, 560\text{ ms} interest ticks, 5.60\text{ s} income cycles) rather than variable display frame rates (requestAnimationFrame).
+ * When browser tabs are backgrounded or minimized, catch up using fixed-step simulation loops without skipping macroeconomic pulses.
+### Phase 4: Test Suite Validation
+Execute the 100 verification scenarios (TS-001 through TS-100) after each implementation phase:
+ * Ensure that no existing offline feature (such as local bot matches, map selection, or basic rendering) suffers a regression.
+ * Maintain an internal changelog tracking which rules are fully verified, which remain approximated, and which require further empirical investigation.
+## Strategic Dynamic Conclusions
+The strategic depth of Territorial.io emerges from the deliberate tension between its two economic phases and its asymmetric combat model.
+During the first 107 seconds of play, the Initial Augmentation Factor boosts interest to 7.00\%, making early balance accumulation exceptionally powerful. Players who spend heavily on premature attacks cripple their compound growth rate, falling behind opponents who expand with disciplined 10%–20% allocations. As the match enters its midgame and the initial boost fades toward 1.00\%, fixed territorial income (+1\text{ balance} per pixel every 5.6\text{ seconds}) becomes the primary engine of economic growth, rewarding players who claimed wide swathes of territory during the opening phase.
+Meanwhile, the structural 2:1 defender bonus acts as a stabilizing force across the map. Because defenders inflict double the casualties they sustain, large empires cannot easily roll over smaller neighbors without exhausting their own reserves. Successful offensives require either patience—waiting for an opponent to overspend or engage in a two-front war—or careful diplomatic coordination.
+By implementing these verified mathematical systems, fixed-step tick loops, and behavioral heuristics, an offline reconstruction can faithfully deliver the strategic depth, tension, and mathematical balance of the original game.
